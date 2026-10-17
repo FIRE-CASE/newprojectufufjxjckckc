@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 # BOT TOKEN
 BOT_TOKEN = "8928950087:AAGFtUkiRgRZnZgMLNF1EJBKtU20xShhqyw"
 
-# CRYPTO BOT API TOKEN (Get from @CryptoBot on Telegram)
-CRYPTO_BOT_TOKEN = "638874:AAVjxZ91qLrkMIl3GFXCvfZvYjr4BlCC6Yq" # Fill in your Crypto Pay API Token
+# CRYPTO BOT API TOKEN
+CRYPTO_BOT_TOKEN = "638874:AAVjxZ91qLrkMIl3GFXCvfZvYjr4BlCC6Yq"
 
 # Default Admin Telegram ID
 DEFAULT_ADMIN_ID = 8106424143
@@ -38,6 +38,15 @@ def init_db():
     conn = sqlite3.connect("ad_exchange.db")
     cursor = conn.cursor()
     
+    # System settings table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_commission', '10.0')")
+    
     # Users table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -52,7 +61,6 @@ def init_db():
             tags TEXT DEFAULT '',
             subscription_id INTEGER,
             subscription_expires TEXT,
-            deals_left INTEGER DEFAULT 0,
             FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
         )
     """)
@@ -64,7 +72,7 @@ def init_db():
             name TEXT,
             price REAL,
             duration_days INTEGER,
-            deals_limit INTEGER
+            commission_discount REAL DEFAULT 0.0 -- процент комиссии по подписке
         )
     """)
     
@@ -89,7 +97,7 @@ def init_db():
             title TEXT,
             description TEXT,
             budget REAL,
-            status TEXT DEFAULT 'open',
+            status TEXT DEFAULT 'open', -- open, in_progress, completed, cancelled
             executor_id INTEGER,
             created_at TEXT
         )
@@ -124,7 +132,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS crypto_invoices (
             invoice_id INTEGER PRIMARY KEY,
             user_id INTEGER,
-            subscription_id INTEGER,
+            type TEXT, -- 'subscription' or 'deposit'
+            target_id INTEGER DEFAULT 0, -- subscription_id if sub
             amount REAL,
             status TEXT DEFAULT 'active'
         )
@@ -138,6 +147,21 @@ init_db()
 def get_db():
     return sqlite3.connect("ad_exchange.db")
 
+def get_setting(key: str, default: str = "0"):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key: str, value: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
 def get_user(user_id: int):
     conn = get_db()
     cursor = conn.cursor()
@@ -147,7 +171,7 @@ def get_user(user_id: int):
     if not row:
         return None
     cols = ['user_id', 'username', 'full_name', 'role', 'balance', 'rating', 'reviews_count', 
-            'commission_rate', 'tags', 'subscription_id', 'subscription_expires', 'deals_left']
+            'commission_rate', 'tags', 'subscription_id', 'subscription_expires']
     return dict(zip(cols, row))
 
 def register_user(user_id: int, username: str, full_name: str):
@@ -156,10 +180,11 @@ def register_user(user_id: int, username: str, full_name: str):
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     if not cursor.fetchone():
         role = 'admin' if user_id == DEFAULT_ADMIN_ID else 'client'
+        def_comm = float(get_setting("default_commission", "10.0"))
         cursor.execute("""
-            INSERT INTO users (user_id, username, full_name, role)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, username or "User", full_name, role))
+            INSERT INTO users (user_id, username, full_name, role, commission_rate)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, username or "User", full_name, role, def_comm))
         conn.commit()
     conn.close()
 
@@ -167,17 +192,28 @@ class AdminStates(StatesGroup):
     waiting_for_sub_name = State()
     waiting_for_sub_price = State()
     waiting_for_sub_days = State()
-    waiting_for_sub_deals = State()
+    waiting_for_sub_comm = State()
     
     waiting_for_cat_parent = State()
     waiting_for_cat_name = State()
     waiting_for_cat_desc = State()
     waiting_for_cat_tag = State()
 
+    waiting_for_global_comm = State()
+    
+    waiting_for_give_balance_uid = State()
+    waiting_for_give_balance_amount = State()
+
 class ClientStates(StatesGroup):
     entering_title = State()
     entering_desc = State()
     entering_budget = State()
+
+class DepositStates(StatesGroup):
+    entering_deposit_amount = State()
+
+class WithdrawStates(StatesGroup):
+    entering_withdraw_amount = State()
 
 class ExecutorApplicationStates(StatesGroup):
     waiting_for_role = State()
@@ -187,6 +223,9 @@ class ReviewStates(StatesGroup):
     entering_rating = State()
     entering_comment = State()
 
+class ChatStates(StatesGroup):
+    in_chat = State()
+
 async def create_crypto_invoice(amount: float, description: str):
     url = "https://pay.crypt.bot/api/createInvoice"
     headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
@@ -195,7 +234,7 @@ async def create_crypto_invoice(amount: float, description: str):
         "amount": str(amount),
         "description": description,
         "paid_btn_name": "openBot",
-        "paid_btn_url": "https://t.me/YourBotUsername"
+        "paid_btn_url": "https://t.me/"
     }
     
     try:
@@ -226,6 +265,25 @@ async def check_crypto_invoice(invoice_id: int):
         logger.error(f"Check invoice error: {e}")
         return None
 
+async def transfer_crypto_user(user_telegram_id: int, amount: float):
+    url = "https://pay.crypt.bot/api/transfer"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    payload = {
+        "user_id": user_telegram_id,
+        "asset": "USDT",
+        "amount": str(amount),
+        "spend_id": f"withdraw_{user_telegram_id}_{int(datetime.now().timestamp())}"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                return data
+    except Exception as e:
+        logger.error(f"Transfer CryptoBot Error: {e}")
+        return None
+
 def main_menu_keyboard(role: str):
     kb = [
         [KeyboardButton(text="📁 Каталог услуг / Заказать"), KeyboardButton(text="👤 Профиль")]
@@ -243,13 +301,16 @@ def admin_menu_keyboard():
     kb = [
         [InlineKeyboardButton(text="📂 Управление каталогом", callback_data="adm_catalog")],
         [InlineKeyboardButton(text="💼 Управление подписками", callback_data="adm_subs")],
+        [InlineKeyboardButton(text="📊 Настройка комиссий", callback_data="adm_commissions")],
+        [InlineKeyboardButton(text="💰 Выдать / Списать баланс", callback_data="adm_give_balance")],
         [InlineKeyboardButton(text="📋 Заявки на исполнителя", callback_data="adm_applications")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 @dp.message(F.text == "/start")
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     user = get_user(message.from_user.id)
     
@@ -273,26 +334,32 @@ async def profile_handler(message: types.Message):
     user = get_user(message.from_user.id)
     
     sub_info = "❌ Нет активной подписки"
+    effective_comm = user['commission_rate']
+    
     if user['subscription_id']:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM subscriptions WHERE id = ?", (user['subscription_id'],))
+        cursor.execute("SELECT name, commission_discount FROM subscriptions WHERE id = ?", (user['subscription_id'],))
         sub_row = cursor.fetchone()
         conn.close()
-        sub_name = sub_row[0] if sub_row else "Неизвестно"
-        sub_info = f"<b>{sub_name}</b>\n └ ⏳ Истекает: <code>{user['subscription_expires']}</code>\n └ 📊 Осталось сделок: <code>{user['deals_left']}</code>"
+        if sub_row:
+            sub_name, comm_disc = sub_row
+            sub_info = f"<b>{sub_name}</b>\n └ ⏳ Истекает: <code>{user['subscription_expires']}</code>"
+            effective_comm = comm_disc
 
     text = (
         f"👤 <b>Ваш личный профиль</b>\n\n"
         f"🆔 <b>ID:</b> <code>{user['user_id']}</code>\n"
         f"🎭 <b>Роль:</b> <code>{user['role'].upper()}</code>\n"
-        f"💰 <b>Баланс:</b> <b>{user['balance']} USDT</b>\n"
+        f"💰 <b>Баланс:</b> <b>{user['balance']:.2f} USDT</b>\n"
         f"⭐ <b>Рейтинг:</b> <b>{user['rating']} / 5.0</b> (Отзывов: {user['reviews_count']})\n"
-        f"📈 <b>Комиссия системы:</b> <b>{user['commission_rate']}%</b>\n\n"
+        f"📈 <b>Комиссия системы:</b> <b>{effective_comm}%</b>\n\n"
         f"📦 <b>Подписка:</b>\n{sub_info}\n"
     )
     
-    kb = []
+    kb = [
+        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit_balance"), InlineKeyboardButton(text="💸 Вывести средства", callback_data="withdraw_balance")]
+    ]
     if user['role'] == 'client':
         kb.append([InlineKeyboardButton(text="📝 Подать заявку на Исполнителя", callback_data="apply_executor")])
         
@@ -300,8 +367,87 @@ async def profile_handler(message: types.Message):
         photo=URLInputFile(PROFILE_IMAGE_URL),
         caption=text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
+
+@dp.callback_query(F.data == "deposit_balance")
+async def deposit_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(DepositStates.entering_deposit_amount)
+    await callback.message.answer("💳 <b>Введите сумму пополнения в USDT (например: 50):</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(DepositStates.entering_deposit_amount)
+async def deposit_amount_entered(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0: raise ValueError()
+    except ValueError:
+        await message.answer("❌ Введите корректное положительное число.")
+        return
+        
+    invoice = await create_crypto_invoice(amount, f"Пополнение баланса пользователя {message.from_user.id}")
+    if not invoice:
+        await message.answer("❌ Ошибка создания счета CryptoBot.")
+        await state.clear()
+        return
+        
+    inv_id = invoice['invoice_id']
+    pay_url = invoice['bot_invoice_url']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO crypto_invoices (invoice_id, user_id, type, amount, status)
+        VALUES (?, ?, 'deposit', ?, 'active')
+    """, (inv_id, message.from_user.id, amount))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    kb = [
+        [InlineKeyboardButton(text="🔗 Оплатить через CryptoBot", url=pay_url)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_inv_{inv_id}")]
+    ]
+    await message.answer(f"🧾 <b>Счет на пополнение баланса создан!</b>\n\nСумма: <b>{amount} USDT</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "withdraw_balance")
+async def withdraw_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    user = get_user(callback.from_user.id)
+    if user['balance'] <= 0:
+        await callback.answer("❌ На вашем балансе нет средств для вывода.", show_alert=True)
+        return
+        
+    await state.set_state(WithdrawStates.entering_withdraw_amount)
+    await callback.message.answer(f"💸 <b>Доступно к выводу: {user['balance']:.2f} USDT</b>\n\nВведите сумму вывода на ваш CryptoBot:", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(WithdrawStates.entering_withdraw_amount)
+async def withdraw_amount_entered(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+        if amount <= 0: raise ValueError()
+    except ValueError:
+        await message.answer("❌ Введите корректное число.")
+        return
+        
+    user = get_user(message.from_user.id)
+    if amount > user['balance']:
+        await message.answer("❌ Недостаточно средств на балансе.")
+        return
+        
+    res = await transfer_crypto_user(message.from_user.id, amount)
+    if res and res.get("ok"):
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, message.from_user.id))
+        conn.commit()
+        conn.close()
+        await message.answer(f"✅ <b>Успешно переведено {amount} USDT на ваш аккаунт CryptoBot!</b>", parse_mode="HTML")
+    else:
+        err_msg = res.get("error", {}).get("name", "Unknown error") if res else "Connection error"
+        await message.answer(f"⚠️ Ошибка автоматического вывода CryptoBot ({err_msg}). Запрос передан администратору.")
+        
+    await state.clear()
 
 @dp.callback_query(F.data == "apply_executor")
 async def start_executor_application(callback: types.CallbackQuery, state: FSMContext):
@@ -371,8 +517,6 @@ async def user_category_view(callback: types.CallbackQuery):
         return
 
     c_id, name, desc, parent_id = cat
-    
-    # Fetch subcategories
     cursor.execute("SELECT id, name FROM categories WHERE parent_id = ?", (cat_id,))
     subcategories = cursor.fetchall()
     conn.close()
@@ -384,7 +528,6 @@ async def user_category_view(callback: types.CallbackQuery):
         for sub_id, sub_name in subcategories:
             kb.append([InlineKeyboardButton(text=f"🔹 {sub_name}", callback_data=f"user_cat_{sub_id}")])
     else:
-        # Final leaf category: allow creating a ticket
         kb.append([InlineKeyboardButton(text="📝 Создать заказ в этой категории", callback_data=f"create_ticket_{cat_id}")])
 
     if parent_id:
@@ -437,10 +580,17 @@ async def ticket_desc_entered(message: types.Message, state: FSMContext):
 async def ticket_budget_entered(message: types.Message, state: FSMContext):
     try:
         budget = float(message.text.replace(",", "."))
+        if budget <= 0: raise ValueError()
     except ValueError:
         await message.answer("❌ Пожалуйста, введите корректное число для бюджета.")
         return
         
+    user = get_user(message.from_user.id)
+    if user['balance'] < budget:
+        await message.answer(f"❌ <b>Недостаточно средств на балансе!</b>\nСтоимость: {budget} USDT\nВаш баланс: {user['balance']:.2f} USDT\n\nПополните баланс в профиле.", parse_mode="HTML")
+        await state.clear()
+        return
+
     data = await state.get_data()
     cat_id = data['category_id']
     title = data['title']
@@ -448,6 +598,8 @@ async def ticket_budget_entered(message: types.Message, state: FSMContext):
     
     conn = get_db()
     cursor = conn.cursor()
+    # Списываем баланс в холдирование
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (budget, message.from_user.id))
     cursor.execute("""
         INSERT INTO tickets (client_id, category_id, title, description, budget, status, created_at)
         VALUES (?, ?, ?, ?, ?, 'open', ?)
@@ -456,13 +608,12 @@ async def ticket_budget_entered(message: types.Message, state: FSMContext):
     conn.close()
     
     await state.clear()
-    await message.answer("✅ <b>Ваш заказ успешно создан и доступен для исполнителей!</b>", parse_mode="HTML")
+    await message.answer("✅ <b>Ваш заказ успешно создан, средства зарезервированы и заказ доступен для исполнителей!</b>", parse_mode="HTML")
 
 @dp.message(F.text == "💼 Мои заказы / Тикеты")
 async def my_tickets_handler(message: types.Message):
     user = get_user(message.from_user.id)
     
-    # Hide functionality for plain clients
     if user['role'] not in ('executor', 'admin'):
         await message.answer("⚠️ Раздел «Мои заказы» доступен только исполнителям и администраторам.")
         return
@@ -483,9 +634,16 @@ async def my_tickets_handler(message: types.Message):
         return
         
     for t in tickets:
-        t_id, title, status, budget = t[0], t[1], t[2], t[3]
+        t_id, title, status, budget, client_id = t[0], t[1], t[2], t[3], t[4]
         text = f"📌 <b>Заказ #{t_id}: {title}</b>\nСтатус: <code>{status.upper()}</code>\nБюджет: <b>{budget} USDT</b>"
-        await message.answer(text, parse_mode="HTML")
+        
+        kb = []
+        if status == 'in_progress':
+            kb.append([InlineKeyboardButton(text="💬 Открыть чат по заказу", callback_data=f"open_chat_{t_id}")])
+            if message.from_user.id == client_id or user['role'] == 'admin':
+                kb.append([InlineKeyboardButton(text="✅ Подтвердить и сдать работу", callback_data=f"complete_ticket_{t_id}")])
+                
+        await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
 
 @dp.message(F.text == "📦 Доступные заказы")
 async def available_tickets_handler(message: types.Message):
@@ -494,8 +652,8 @@ async def available_tickets_handler(message: types.Message):
         await message.answer("Раздел доступен только исполнителям.")
         return
         
-    if not user['subscription_id'] or user['deals_left'] <= 0:
-        await message.answer("⚠️ У вас нет активной подписки или исчерпан лимит сделок.")
+    if not user['subscription_id']:
+        await message.answer("⚠️ У вас нет активной подписки.")
         return
         
     conn = get_db()
@@ -523,12 +681,7 @@ async def available_tickets_handler(message: types.Message):
 @dp.callback_query(F.data.startswith("take_ticket_"))
 async def take_ticket_callback(callback: types.CallbackQuery):
     t_id = int(callback.data.split("_")[2])
-    user = get_user(callback.from_user.id)
     
-    if user['deals_left'] <= 0:
-        await callback.answer("У вас исчерпан лимит сделок по подписке!", show_alert=True)
-        return
-        
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT status, client_id FROM tickets WHERE id = ?", (t_id,))
@@ -541,22 +694,75 @@ async def take_ticket_callback(callback: types.CallbackQuery):
         
     client_id = ticket[1]
     cursor.execute("UPDATE tickets SET status = 'in_progress', executor_id = ? WHERE id = ?", (callback.from_user.id, t_id))
-    cursor.execute("UPDATE users SET deals_left = deals_left - 1 WHERE user_id = ?", (callback.from_user.id,))
     conn.commit()
     conn.close()
     
-    await callback.message.edit_text(f"✅ Вы успешно взяли заказ #{t_id} в работу!")
+    await callback.message.edit_text(f"✅ Вы успешно взяли заказ #{t_id} в работу!\nОткройте «Мои заказы», чтобы общаться с клиентом в чате.")
     try:
-        await bot.send_message(client_id, f"🎉 Ваш заказ #{t_id} взят в работу исполнителем!")
+        await bot.send_message(client_id, f"🎉 <b>Ваш заказ #{t_id} взят в работу исполнителем!</b>\nПерейдите в тикеты для общения в чате.", parse_mode="HTML")
     except Exception:
         pass
+
+@dp.callback_query(F.data.startswith("open_chat_"))
+async def open_chat_callback(callback: types.CallbackQuery, state: FSMContext):
+    t_id = int(callback.data.split("_")[2])
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT client_id, executor_id, title FROM tickets WHERE id = ?", (t_id,))
+    ticket = cursor.fetchone()
+    conn.close()
+    
+    if not ticket:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+        
+    client_id, exec_id, title = ticket
+    user_id = callback.from_user.id
+    
+    if user_id not in (client_id, exec_id):
+        await callback.answer("Вы не участник этого заказа.", show_alert=True)
+        return
+        
+    target_id = exec_id if user_id == client_id else client_id
+    
+    await state.set_state(ChatStates.in_chat)
+    await state.update_data(chat_ticket_id=t_id, chat_target_id=target_id)
+    
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Выйти из чата")]], resize_keyboard=True)
+    await callback.message.answer(f"💬 <b>Чат по заказу #{t_id} ({title}) открыт!</b>\nВсе отправленные сюда сообщения будут переданы собеседнику.", parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+@dp.message(ChatStates.in_chat, F.text == "❌ Выйти из чата")
+async def exit_chat_handler(message: types.Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    await state.clear()
+    await message.answer("🚪 Вы вышли из чата тикета.", reply_markup=main_menu_keyboard(user['role']))
+
+@dp.message(ChatStates.in_chat)
+async def process_chat_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    t_id = data.get("chat_ticket_id")
+    target_id = data.get("chat_target_id")
+    
+    prefix = f"💬 <b>[Чат Заказа #{t_id}]:</b>\n"
+    try:
+        if message.text:
+            await bot.send_message(target_id, prefix + message.text, parse_mode="HTML")
+        elif message.photo:
+            await bot.send_photo(target_id, message.photo[-1].file_id, caption=prefix + (message.caption or ""), parse_mode="HTML")
+        elif message.document:
+            await bot.send_document(target_id, message.document.file_id, caption=prefix + (message.caption or ""), parse_mode="HTML")
+        await message.answer("✅ <i>Сообщение отправлено</i>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось доставить сообщение собеседнику: {e}")
 
 @dp.callback_query(F.data.startswith("complete_ticket_"))
 async def complete_ticket_callback(callback: types.CallbackQuery, state: FSMContext):
     t_id = int(callback.data.split("_")[2])
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT executor_id, budget FROM tickets WHERE id = ? AND client_id = ?", (t_id, callback.from_user.id))
+    cursor.execute("SELECT executor_id, budget, client_id FROM tickets WHERE id = ?", (t_id,))
     ticket = cursor.fetchone()
     
     if not ticket:
@@ -564,28 +770,44 @@ async def complete_ticket_callback(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("Заказ не найден.", show_alert=True)
         return
         
-    exec_id, budget = ticket
+    exec_id, budget, client_id = ticket
+    if callback.from_user.id != client_id and callback.from_user.id != DEFAULT_ADMIN_ID:
+        conn.close()
+        await callback.answer("Только заказчик может подтвердить выполнение сделки.", show_alert=True)
+        return
+        
     cursor.execute("UPDATE tickets SET status = 'completed' WHERE id = ?", (t_id,))
     
-    cursor.execute("SELECT commission_rate FROM users WHERE user_id = ?", (exec_id,))
-    comm_row = cursor.fetchone()
-    comm_rate = comm_row[0] if comm_row else 10.0
+    # Расчет комиссии исполнителя
+    cursor.execute("SELECT subscription_id, commission_rate FROM users WHERE user_id = ?", (exec_id,))
+    exec_user = cursor.fetchone()
     
-    payout = budget * (1 - comm_rate / 100.0)
+    effective_comm = exec_user[1] if exec_user else 10.0
+    if exec_user and exec_user[0]:
+        cursor.execute("SELECT commission_discount FROM subscriptions WHERE id = ?", (exec_user[0],))
+        sub_comm = cursor.fetchone()
+        if sub_comm:
+            effective_comm = sub_comm[0]
+            
+    payout = budget * (1 - effective_comm / 100.0)
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (payout, exec_id))
     conn.commit()
     conn.close()
     
+    try:
+        await bot.send_message(exec_id, f"🎉 <b>Заказ #{t_id} подтвержден!</b>\nНа ваш баланс зачислено <b>{payout:.2f} USDT</b> (Комиссия: {effective_comm}%).", parse_mode="HTML")
+    except Exception:
+        pass
+        
     await state.update_data(review_executor_id=exec_id, review_ticket_id=t_id)
     await state.set_state(ReviewStates.entering_rating)
-    await callback.message.answer("✅ <b>Заказ выполнен! Оцените работу исполнителя (от 1 до 5):</b>", parse_mode="HTML")
+    await callback.message.answer("✅ <b>Сделка подтверждена! Оцените работу исполнителя (от 1 до 5):</b>", parse_mode="HTML")
 
 @dp.message(ReviewStates.entering_rating)
 async def review_rating_entered(message: types.Message, state: FSMContext):
     try:
         rating = int(message.text)
-        if not (1 <= rating <= 5):
-            raise ValueError()
+        if not (1 <= rating <= 5): raise ValueError()
     except ValueError:
         await message.answer("Пожалуйста, введите число от 1 до 5.")
         return
@@ -641,17 +863,18 @@ async def my_subscription_handler(message: types.Message):
         sub_info = (
             f"✅ <b>Текущий активный тариф: {sub_name}</b>\n"
             f"⏳ <b>Действительна до:</b> <code>{user['subscription_expires']}</code>\n"
-            f"📊 <b>Осталось доступных сделок:</b> <code>{user['deals_left']}</code>\n"
         )
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, duration_days, deals_limit FROM subscriptions")
+    cursor.execute("SELECT id, name, price, duration_days, commission_discount FROM subscriptions")
     subs = cursor.fetchall()
     conn.close()
 
-    text = f"💳 <b>Информация о подписке:</b>\n\n{sub_info}\n\n👇 <b>Выберите тариф для покупки/продления через CryptoBot:</b>"
-    kb = [[InlineKeyboardButton(text=f"💎 {name} - {price} USDT ({days} дн. / {deals} сделок)", callback_data=f"buy_crypto_{s_id}")] for s_id, name, price, days, deals in subs]
+    text = f"💳 <b>Информация о подписке:</b>\n\n{sub_info}\n\n👇 <b>Выберите тариф для покупки:</b>"
+    kb = []
+    for s_id, name, price, days, comm in subs:
+        kb.append([InlineKeyboardButton(text=f"💎 {name} - {price} USDT ({days} дн. / Ком.: {comm}%)", callback_data=f"sub_choice_{s_id}")])
 
     await message.answer_photo(
         photo=URLInputFile(SUB_IMAGE_URL),
@@ -660,8 +883,8 @@ async def my_subscription_handler(message: types.Message):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
     )
 
-@dp.callback_query(F.data.startswith("buy_crypto_"))
-async def buy_crypto_callback(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("sub_choice_"))
+async def sub_choice_callback(callback: types.CallbackQuery):
     sub_id = int(callback.data.split("_")[2])
     conn = get_db()
     cursor = conn.cursor()
@@ -674,8 +897,56 @@ async def buy_crypto_callback(callback: types.CallbackQuery):
         return
         
     sub_name, price = sub
-    invoice = await create_crypto_invoice(price, f"Оплата подписки {sub_name}")
+    kb = [
+        [InlineKeyboardButton(text="💰 Оплатить с баланса", callback_data=f"buy_sub_bal_{sub_id}")],
+        [InlineKeyboardButton(text="🔗 Оплатить через CryptoBot", callback_data=f"buy_sub_crypto_{sub_id}")]
+    ]
+    await callback.message.answer(f"💎 <b>Оплата подписки {sub_name}</b>\nСтоимость: <b>{price} USDT</b>\n\nВыберите способ оплаты:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("buy_sub_bal_"))
+async def buy_sub_balance_callback(callback: types.CallbackQuery):
+    sub_id = int(callback.data.split("_")[3])
+    user = get_user(callback.from_user.id)
     
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT price, duration_days FROM subscriptions WHERE id = ?", (sub_id,))
+    sub = cursor.fetchone()
+    
+    if not sub:
+        conn.close()
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+        
+    price, days = sub
+    if user['balance'] < price:
+        conn.close()
+        await callback.answer(f"❌ Недостаточно средств на балансе ({user['balance']:.2f} USDT).", show_alert=True)
+        return
+        
+    expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    cursor.execute("UPDATE users SET balance = balance - ?, subscription_id = ?, subscription_expires = ? WHERE user_id = ?", (price, sub_id, expires, callback.from_user.id))
+    conn.commit()
+    conn.close()
+    
+    await callback.message.edit_text(f"🎉 <b>Подписка успешно куплена с баланса!</b>\nДействует до: {expires}", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("buy_sub_crypto_"))
+async def buy_sub_crypto_callback(callback: types.CallbackQuery):
+    sub_id = int(callback.data.split("_")[3])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, price FROM subscriptions WHERE id = ?", (sub_id,))
+    sub = cursor.fetchone()
+    conn.close()
+    
+    if not sub:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+        
+    sub_name, price = sub
+    invoice = await create_crypto_invoice(price, f"Оплата подписки {sub_name}")
     if not invoice:
         await callback.answer("Ошибка генерации счета CryptoBot.", show_alert=True)
         return
@@ -686,8 +957,8 @@ async def buy_crypto_callback(callback: types.CallbackQuery):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO crypto_invoices (invoice_id, user_id, subscription_id, amount, status)
-        VALUES (?, ?, ?, ?, 'active')
+        INSERT INTO crypto_invoices (invoice_id, user_id, type, target_id, amount, status)
+        VALUES (?, ?, 'subscription', ?, ?, 'active')
     """, (inv_id, callback.from_user.id, sub_id, price))
     conn.commit()
     conn.close()
@@ -711,25 +982,26 @@ async def check_invoice_callback(callback: types.CallbackQuery):
     if status == 'paid':
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, subscription_id FROM crypto_invoices WHERE invoice_id = ?", (inv_id,))
+        cursor.execute("SELECT user_id, type, target_id, amount, status FROM crypto_invoices WHERE invoice_id = ?", (inv_id,))
         inv_row = cursor.fetchone()
         
-        if inv_row:
-            u_id, sub_id = inv_row
-            cursor.execute("SELECT duration_days, deals_limit FROM subscriptions WHERE id = ?", (sub_id,))
-            sub = cursor.fetchone()
-            if sub:
-                days, deals = sub
-                expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
-                cursor.execute("""
-                    UPDATE users SET subscription_id = ?, subscription_expires = ?, deals_left = deals_left + ?
-                    WHERE user_id = ?
-                """, (sub_id, expires, deals, u_id))
-                cursor.execute("UPDATE crypto_invoices SET status = 'paid' WHERE invoice_id = ?", (inv_id,))
-                conn.commit()
+        if inv_row and inv_row[4] == 'active':
+            u_id, inv_type, target_id, amount = inv_row[0], inv_row[1], inv_row[2], inv_row[3]
+            
+            if inv_type == 'subscription':
+                cursor.execute("SELECT duration_days FROM subscriptions WHERE id = ?", (target_id,))
+                sub = cursor.fetchone()
+                if sub:
+                    expires = (datetime.now() + timedelta(days=sub[0])).strftime("%Y-%m-%d %H:%M")
+                    cursor.execute("UPDATE users SET subscription_id = ?, subscription_expires = ? WHERE user_id = ?", (target_id, expires, u_id))
+            elif inv_type == 'deposit':
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, u_id))
+                
+            cursor.execute("UPDATE crypto_invoices SET status = 'paid' WHERE invoice_id = ?", (inv_id,))
+            conn.commit()
+            
         conn.close()
-        
-        await callback.message.edit_text("🎉 <b>Оплата подтверждена! Подписка успешно активирована!</b>", parse_mode="HTML")
+        await callback.message.edit_text("🎉 <b>Оплата подтверждена! Баланс/подписка успешно обновлены!</b>", parse_mode="HTML")
     else:
         await callback.answer("⏳ Оплата еще не поступила или находится в обработке.", show_alert=True)
 
@@ -760,6 +1032,81 @@ async def back_to_admin(callback: types.CallbackQuery):
         parse_mode="HTML",
         reply_markup=admin_menu_keyboard()
     )
+
+@dp.callback_query(F.data == "adm_commissions")
+async def adm_commissions_view(callback: types.CallbackQuery):
+    def_comm = get_setting("default_commission", "10.0")
+    text = (
+        f"📊 <b>Управление процентом комиссии:</b>\n\n"
+        f"📈 <b>Общий процент комиссии по умолчанию:</b> <code>{def_comm}%</code>\n\n"
+        f"Для изменения общего процента нажмите кнопку ниже 👇"
+    )
+    kb = [
+        [InlineKeyboardButton(text="✏️ Изменить общий процент", callback_data="change_global_comm")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_admin")]
+    ]
+    await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "change_global_comm")
+async def change_global_comm_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_global_comm)
+    await callback.message.answer("✍️ <b>Введите новый общий процент комиссии (например: 8.5):</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_global_comm)
+async def global_comm_entered(message: types.Message, state: FSMContext):
+    try:
+        comm = float(message.text.replace(",", "."))
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректное число.")
+        return
+        
+    set_setting("default_commission", str(comm))
+    await state.clear()
+    await message.answer(f"✅ <b>Общий процент комиссии системы успешно устновлен на {comm}%!</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data == "adm_give_balance")
+async def adm_give_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_give_balance_uid)
+    await callback.message.answer("✍️ <b>Введите Telegram ID пользователя:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_give_balance_uid)
+async def give_balance_uid_entered(message: types.Message, state: FSMContext):
+    try:
+        uid = int(message.text)
+    except ValueError:
+        await message.answer("Введите корректный числовой Telegram ID.")
+        return
+        
+    user = get_user(uid)
+    if not user:
+        await message.answer("❌ Пользователь не найден в базе данных.")
+        return
+        
+    await state.update_data(target_uid=uid)
+    await state.set_state(AdminStates.waiting_for_give_balance_amount)
+    await message.answer(f"💰 <b>Пользователь:</b> {user['full_name']} (Баланс: {user['balance']:.2f} USDT)\n\nВведите сумму изменения баланса (положительное число для зачисления, отрицательное для списания):", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_give_balance_amount)
+async def give_balance_amount_entered(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+    except ValueError:
+        await message.answer("Введите число.")
+        return
+        
+    data = await state.get_data()
+    uid = data['target_uid']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, uid))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer(f"✅ <b>Баланс пользователя {uid} успешно изменен на {amount} USDT!</b>", parse_mode="HTML")
 
 @dp.callback_query(F.data == "adm_catalog")
 async def adm_catalog_view(callback: types.CallbackQuery):
@@ -842,15 +1189,15 @@ async def cat_tag_entered(message: types.Message, state: FSMContext):
 async def adm_subs_view(callback: types.CallbackQuery):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, duration_days, deals_limit FROM subscriptions")
+    cursor.execute("SELECT id, name, price, duration_days, commission_discount FROM subscriptions")
     subs = cursor.fetchall()
     conn.close()
     
     text = "💼 <b>Управление тарифными планами:</b>\n\n"
     kb = []
     if subs:
-        for s_id, name, price, days, deals in subs:
-            text += f"💎 <b>#{s_id} {name}</b> — {price} USDT ({days} дней, {deals} сделок)\n"
+        for s_id, name, price, days, comm in subs:
+            text += f"💎 <b>#{s_id} {name}</b> — {price} USDT ({days} дней, комиссия: {comm}%)\n"
             kb.append([InlineKeyboardButton(text=f"❌ Удалить #{s_id}", callback_data=f"del_sub_{s_id}")])
     else:
         text += "Подписки отсутствуют."
@@ -891,24 +1238,24 @@ async def sub_days_entered(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, введите целое число.")
         return
     await state.update_data(days=days)
-    await state.set_state(AdminStates.waiting_for_sub_deals)
-    await message.answer("📊 <b>Укажите лимит доступных сделок:</b>", parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_for_sub_comm)
+    await message.answer("📊 <b>Укажите процент комиссии по этой подписке (например: 5.0):</b>", parse_mode="HTML")
 
-@dp.message(AdminStates.waiting_for_sub_deals)
-async def sub_deals_entered(message: types.Message, state: FSMContext):
+@dp.message(AdminStates.waiting_for_sub_comm)
+async def sub_comm_entered(message: types.Message, state: FSMContext):
     try:
-        deals = int(message.text)
+        comm = float(message.text.replace(",", "."))
     except ValueError:
-        await message.answer("Пожалуйста, введите целое число.")
+        await message.answer("Пожалуйста, введите корректное число.")
         return
         
     data = await state.get_data()
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO subscriptions (name, price, duration_days, deals_limit)
+        INSERT INTO subscriptions (name, price, duration_days, commission_discount)
         VALUES (?, ?, ?, ?)
-    """, (data['name'], data['price'], data['days'], deals))
+    """, (data['name'], data['price'], data['days'], comm))
     conn.commit()
     conn.close()
     
@@ -964,7 +1311,7 @@ async def approve_app_callback(callback: types.CallbackQuery):
         conn.commit()
         
         try:
-            await bot.send_message(u_id, "🎉 <b>Поздравляем! Ваша заявка на статус Исполнителя одобрена!</b>\nПерезапустите бота или отправьте /start для обновления меню.", parse_mode="HTML")
+            await bot.send_message(u_id, "🎉 <b>Поздравляем! Ваша заявка на статус Исполнителя одобрена!</b>\nОтправьте /start для обновления меню.", parse_mode="HTML")
         except Exception:
             pass
 
@@ -995,7 +1342,7 @@ async def reject_app_callback(callback: types.CallbackQuery):
     await adm_applications_view(callback)
 
 async def main():
-    print("🚀 Bot started successfully with all fixes applied!")
+    print("🚀 Bot started successfully with all new features!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
