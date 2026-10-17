@@ -25,10 +25,10 @@ DEFAULT_ADMIN_ID = 8106424143
 
 # Default images for post categories
 DEFAULT_IMAGE_URL = "https://i.postimg.cc/x1bmDmVC/Picsart-26-09-26-09-06-01-420.jpg"
-PROFILE_IMAGE_URL = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=1200&q=80"
-CATALOG_IMAGE_URL = "https://images.unsplash.com/photo-1460925895917-afdab827c52f?auto=format&fit=crop&w=1200&q=80"
-SUB_IMAGE_URL = "https://images.unsplash.com/photo-1559526324-4b87b5e36e44?auto=format&fit=crop&w=1200&q=80"
-ADMIN_IMAGE_URL = "https://images.unsplash.com/photo-1551836022-d5d88e9218df?auto=format&fit=crop&w=1200&q=80"
+PROFILE_IMAGE_URL = "https://i.postimg.cc/x1bmDmVC/Picsart-26-09-26-09-06-01-420.jpg"
+CATALOG_IMAGE_URL = "https://i.postimg.cc/x1bmDmVC/Picsart-26-09-26-09-06-01-420.jpg"
+SUB_IMAGE_URL = "https://i.postimg.cc/x1bmDmVC/Picsart-26-09-26-09-06-01-420.jpg"
+ADMIN_IMAGE_URL = "https://i.postimg.cc/x1bmDmVC/Picsart-26-09-26-09-06-01-420.jpg"
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -228,9 +228,11 @@ async def check_crypto_invoice(invoice_id: int):
 
 def main_menu_keyboard(role: str):
     kb = [
-        [KeyboardButton(text="📁 Каталог услуг / Заказать"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="💼 Мои заказы / Тикеты")]
+        [KeyboardButton(text="📁 Каталог услуг / Заказать"), KeyboardButton(text="👤 Профиль")]
     ]
+    if role in ('executor', 'admin'):
+        kb.append([KeyboardButton(text="💼 Мои заказы / Тикеты")])
+        
     if role == 'executor':
         kb.append([KeyboardButton(text="📦 Доступные заказы"), KeyboardButton(text="💳 Моя подписка")])
     elif role == 'admin':
@@ -300,6 +302,36 @@ async def profile_handler(message: types.Message):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
     )
+
+@dp.callback_query(F.data == "apply_executor")
+async def start_executor_application(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ExecutorApplicationStates.waiting_for_role)
+    await callback.message.answer("📝 <b>Укажите желаемую специализацию / роль (например: Блогер, Таргетолог):</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(ExecutorApplicationStates.waiting_for_role)
+async def app_role_entered(message: types.Message, state: FSMContext):
+    await state.update_data(requested_role=message.text)
+    await state.set_state(ExecutorApplicationStates.waiting_for_comment)
+    await message.answer("✍️ <b>Напишите комментарий о вашем опыте или прикрепите портфолио/ссылки:</b>", parse_mode="HTML")
+
+@dp.message(ExecutorApplicationStates.waiting_for_comment)
+async def app_comment_entered(message: types.Message, state: FSMContext):
+    comment = message.text
+    data = await state.get_data()
+    role = data['requested_role']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO executor_applications (user_id, requested_role, comment, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (message.from_user.id, role, comment, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer("✅ <b>Ваша заявка успешно отправлена на рассмотрение администратору!</b>", parse_mode="HTML")
 
 @dp.message(F.text == "📁 Каталог услуг / Заказать")
 async def catalog_handler(message: types.Message):
@@ -429,12 +461,16 @@ async def ticket_budget_entered(message: types.Message, state: FSMContext):
 @dp.message(F.text == "💼 Мои заказы / Тикеты")
 async def my_tickets_handler(message: types.Message):
     user = get_user(message.from_user.id)
+    
+    # Hide functionality for plain clients
+    if user['role'] not in ('executor', 'admin'):
+        await message.answer("⚠️ Раздел «Мои заказы» доступен только исполнителям и администраторам.")
+        return
+
     conn = get_db()
     cursor = conn.cursor()
     
-    if user['role'] == 'client':
-        cursor.execute("SELECT id, title, status, budget, executor_id FROM tickets WHERE client_id = ?", (message.from_user.id,))
-    elif user['role'] == 'executor':
+    if user['role'] == 'executor':
         cursor.execute("SELECT id, title, status, budget, client_id FROM tickets WHERE executor_id = ?", (message.from_user.id,))
     else:
         cursor.execute("SELECT id, title, status, budget, client_id FROM tickets")
@@ -449,12 +485,7 @@ async def my_tickets_handler(message: types.Message):
     for t in tickets:
         t_id, title, status, budget = t[0], t[1], t[2], t[3]
         text = f"📌 <b>Заказ #{t_id}: {title}</b>\nСтатус: <code>{status.upper()}</code>\nБюджет: <b>{budget} USDT</b>"
-        
-        kb = []
-        if user['role'] == 'client' and status == 'in_progress':
-            kb.append([InlineKeyboardButton(text="✅ Подтвердить выполнение", callback_data=f"complete_ticket_{t_id}")])
-            
-        await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
+        await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "📦 Доступные заказы")
 async def available_tickets_handler(message: types.Message):
@@ -629,6 +660,79 @@ async def my_subscription_handler(message: types.Message):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
     )
 
+@dp.callback_query(F.data.startswith("buy_crypto_"))
+async def buy_crypto_callback(callback: types.CallbackQuery):
+    sub_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, price FROM subscriptions WHERE id = ?", (sub_id,))
+    sub = cursor.fetchone()
+    conn.close()
+    
+    if not sub:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+        
+    sub_name, price = sub
+    invoice = await create_crypto_invoice(price, f"Оплата подписки {sub_name}")
+    
+    if not invoice:
+        await callback.answer("Ошибка генерации счета CryptoBot.", show_alert=True)
+        return
+        
+    inv_id = invoice['invoice_id']
+    pay_url = invoice['bot_invoice_url']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO crypto_invoices (invoice_id, user_id, subscription_id, amount, status)
+        VALUES (?, ?, ?, ?, 'active')
+    """, (inv_id, callback.from_user.id, sub_id, price))
+    conn.commit()
+    conn.close()
+    
+    kb = [
+        [InlineKeyboardButton(text="🔗 Оплатить через CryptoBot", url=pay_url)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_inv_{inv_id}")]
+    ]
+    await callback.message.answer(
+        f"🧾 <b>Счет на оплату подписки {sub_name} создан!</b>\n\nСумма: <b>{price} USDT</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("check_inv_"))
+async def check_invoice_callback(callback: types.CallbackQuery):
+    inv_id = int(callback.data.split("_")[2])
+    status = await check_crypto_invoice(inv_id)
+    
+    if status == 'paid':
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, subscription_id FROM crypto_invoices WHERE invoice_id = ?", (inv_id,))
+        inv_row = cursor.fetchone()
+        
+        if inv_row:
+            u_id, sub_id = inv_row
+            cursor.execute("SELECT duration_days, deals_limit FROM subscriptions WHERE id = ?", (sub_id,))
+            sub = cursor.fetchone()
+            if sub:
+                days, deals = sub
+                expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+                cursor.execute("""
+                    UPDATE users SET subscription_id = ?, subscription_expires = ?, deals_left = deals_left + ?
+                    WHERE user_id = ?
+                """, (sub_id, expires, deals, u_id))
+                cursor.execute("UPDATE crypto_invoices SET status = 'paid' WHERE invoice_id = ?", (inv_id,))
+                conn.commit()
+        conn.close()
+        
+        await callback.message.edit_text("🎉 <b>Оплата подтверждена! Подписка успешно активирована!</b>", parse_mode="HTML")
+    else:
+        await callback.answer("⏳ Оплата еще не поступила или находится в обработке.", show_alert=True)
+
 @dp.message(F.text == "⚙️ Админ-панель")
 async def admin_panel(message: types.Message):
     user = get_user(message.from_user.id)
@@ -638,6 +742,20 @@ async def admin_panel(message: types.Message):
         
     await message.answer_photo(
         photo=URLInputFile(ADMIN_IMAGE_URL),
+        caption="⚙️ <b>Панель управления администратора:</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "main_menu")
+async def back_to_main_menu(callback: types.CallbackQuery):
+    user = get_user(callback.from_user.id)
+    await callback.message.answer("🏠 <b>Главное меню:</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user['role']))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(callback: types.CallbackQuery):
+    await callback.message.edit_caption(
         caption="⚙️ <b>Панель управления администратора:</b>",
         parse_mode="HTML",
         reply_markup=admin_menu_keyboard()
@@ -665,13 +783,216 @@ async def adm_catalog_view(callback: types.CallbackQuery):
     ]
     await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.callback_query(F.data == "back_to_admin")
-async def back_to_admin(callback: types.CallbackQuery):
-    await callback.message.edit_caption(
-        caption="⚙️ <b>Панель управления администратора:</b>",
-        parse_mode="HTML",
-        reply_markup=admin_menu_keyboard()
-    )
+@dp.callback_query(F.data == "add_cat_start")
+async def add_cat_start(callback: types.CallbackQuery, state: FSMContext):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM categories WHERE parent_id IS NULL")
+    parents = cursor.fetchall()
+    conn.close()
+    
+    kb = [[InlineKeyboardButton(text="📁 Создать как корневой раздел", callback_data="set_parent_none")]]
+    for p_id, p_name in parents:
+        kb.append([InlineKeyboardButton(text=f"└ 🔹 Вложить в {p_name}", callback_data=f"set_parent_{p_id}")])
+        
+    await state.set_state(AdminStates.waiting_for_cat_parent)
+    await callback.message.answer("📁 <b>Выберите родительскую категорию для нового раздела:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_parent_"))
+async def cat_parent_selected(callback: types.CallbackQuery, state: FSMContext):
+    raw_id = callback.data.split("_")[2]
+    parent_id = None if raw_id == "none" else int(raw_id)
+    
+    await state.update_data(parent_id=parent_id)
+    await state.set_state(AdminStates.waiting_for_cat_name)
+    await callback.message.answer("✍️ <b>Введите название раздела/подраздела:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_cat_name)
+async def cat_name_entered(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(AdminStates.waiting_for_cat_desc)
+    await message.answer("📝 <b>Введите описание раздела:</b>", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_cat_desc)
+async def cat_desc_entered(message: types.Message, state: FSMContext):
+    await state.update_data(desc=message.text)
+    await state.set_state(AdminStates.waiting_for_cat_tag)
+    await message.answer("🏷 <b>Введите тег раздела (slug, например: telegram_ads):</b>", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_cat_tag)
+async def cat_tag_entered(message: types.Message, state: FSMContext):
+    tag = message.text.strip()
+    data = await state.get_data()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO categories (parent_id, name, description, tag_slug)
+        VALUES (?, ?, ?, ?)
+    """, (data['parent_id'], data['name'], data['desc'], tag))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer("✅ <b>Раздел успешно добавлен в каталог!</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data == "adm_subs")
+async def adm_subs_view(callback: types.CallbackQuery):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, price, duration_days, deals_limit FROM subscriptions")
+    subs = cursor.fetchall()
+    conn.close()
+    
+    text = "💼 <b>Управление тарифными планами:</b>\n\n"
+    kb = []
+    if subs:
+        for s_id, name, price, days, deals in subs:
+            text += f"💎 <b>#{s_id} {name}</b> — {price} USDT ({days} дней, {deals} сделок)\n"
+            kb.append([InlineKeyboardButton(text=f"❌ Удалить #{s_id}", callback_data=f"del_sub_{s_id}")])
+    else:
+        text += "Подписки отсутствуют."
+        
+    kb.append([InlineKeyboardButton(text="➕ Создать новый тариф", callback_data="add_sub_start")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_admin")])
+    
+    await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "add_sub_start")
+async def add_sub_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_sub_name)
+    await callback.message.answer("✍️ <b>Введите название тарифа:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_sub_name)
+async def sub_name_entered(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(AdminStates.waiting_for_sub_price)
+    await message.answer("💰 <b>Введите стоимость тарифа в USDT:</b>", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_sub_price)
+async def sub_price_entered(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text.replace(",", "."))
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректное число.")
+        return
+    await state.update_data(price=price)
+    await state.set_state(AdminStates.waiting_for_sub_days)
+    await message.answer("⏳ <b>Укажите срок действия в днях:</b>", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_sub_days)
+async def sub_days_entered(message: types.Message, state: FSMContext):
+    try:
+        days = int(message.text)
+    except ValueError:
+        await message.answer("Пожалуйста, введите целое число.")
+        return
+    await state.update_data(days=days)
+    await state.set_state(AdminStates.waiting_for_sub_deals)
+    await message.answer("📊 <b>Укажите лимит доступных сделок:</b>", parse_mode="HTML")
+
+@dp.message(AdminStates.waiting_for_sub_deals)
+async def sub_deals_entered(message: types.Message, state: FSMContext):
+    try:
+        deals = int(message.text)
+    except ValueError:
+        await message.answer("Пожалуйста, введите целое число.")
+        return
+        
+    data = await state.get_data()
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO subscriptions (name, price, duration_days, deals_limit)
+        VALUES (?, ?, ?, ?)
+    """, (data['name'], data['price'], data['days'], deals))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer("✅ <b>Тариф успешно добавлен!</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("del_sub_"))
+async def del_sub_callback(callback: types.CallbackQuery):
+    s_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM subscriptions WHERE id = ?", (s_id,))
+    conn.commit()
+    conn.close()
+    await callback.answer("Тариф удален.", show_alert=True)
+    await adm_subs_view(callback)
+
+@dp.callback_query(F.data == "adm_applications")
+async def adm_applications_view(callback: types.CallbackQuery):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, user_id, requested_role, comment, created_at FROM executor_applications WHERE status = 'pending'")
+    apps = cursor.fetchall()
+    conn.close()
+    
+    text = "📋 <b>Заявки на статус Исполнителя:</b>\n\n"
+    if not apps:
+        text += "Нет новых нерассмотренных заявок."
+        
+    kb = []
+    for a_id, u_id, role, comment, created in apps:
+        text += f"🆔 <b>Заявка #{a_id}</b> от ID <code>{u_id}</code>\n └ Роль: <b>{role}</b>\n └ Комментарий: {comment}\n\n"
+        kb.append([
+            InlineKeyboardButton(text=f"✅ Одобрить #{a_id}", callback_data=f"approve_app_{a_id}"),
+            InlineKeyboardButton(text=f"❌ Отклонить #{a_id}", callback_data=f"reject_app_{a_id}")
+        ])
+        
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_admin")])
+    await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("approve_app_"))
+async def approve_app_callback(callback: types.CallbackQuery):
+    a_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM executor_applications WHERE id = ?", (a_id,))
+    app = cursor.fetchone()
+    
+    if app:
+        u_id = app[0]
+        cursor.execute("UPDATE executor_applications SET status = 'approved' WHERE id = ?", (a_id,))
+        cursor.execute("UPDATE users SET role = 'executor' WHERE user_id = ?", (u_id,))
+        conn.commit()
+        
+        try:
+            await bot.send_message(u_id, "🎉 <b>Поздравляем! Ваша заявка на статус Исполнителя одобрена!</b>\nПерезапустите бота или отправьте /start для обновления меню.", parse_mode="HTML")
+        except Exception:
+            pass
+
+    conn.close()
+    await callback.answer("Заявка одобрена!")
+    await adm_applications_view(callback)
+
+@dp.callback_query(F.data.startswith("reject_app_"))
+async def reject_app_callback(callback: types.CallbackQuery):
+    a_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM executor_applications WHERE id = ?", (a_id,))
+    app = cursor.fetchone()
+    
+    if app:
+        u_id = app[0]
+        cursor.execute("UPDATE executor_applications SET status = 'rejected' WHERE id = ?", (a_id,))
+        conn.commit()
+        
+        try:
+            await bot.send_message(u_id, "❌ <b>К сожалению, ваша заявка на статус Исполнителя была отклонена.</b>", parse_mode="HTML")
+        except Exception:
+            pass
+
+    conn.close()
+    await callback.answer("Заявка отклонена!")
+    await adm_applications_view(callback)
 
 async def main():
     print("🚀 Bot started successfully with all fixes applied!")
