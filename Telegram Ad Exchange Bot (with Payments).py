@@ -72,7 +72,7 @@ def init_db():
             name TEXT,
             price REAL,
             duration_days INTEGER,
-            commission_discount REAL DEFAULT 0.0 -- процент комиссии по подписке
+            commission_discount REAL DEFAULT 0.0
         )
     """)
     
@@ -85,6 +85,22 @@ def init_db():
             description TEXT,
             tag_slug TEXT,
             FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE
+        )
+    """)
+    
+    # Executor Listings (Goods / Services published by executors) table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS executor_listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            executor_id INTEGER,
+            category_id INTEGER,
+            title TEXT,
+            description TEXT,
+            price REAL,
+            status TEXT DEFAULT 'pending', -- pending, active, rejected
+            created_at TEXT,
+            FOREIGN KEY (executor_id) REFERENCES users(user_id),
+            FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
         )
     """)
     
@@ -133,7 +149,7 @@ def init_db():
             invoice_id INTEGER PRIMARY KEY,
             user_id INTEGER,
             type TEXT, -- 'subscription' or 'deposit'
-            target_id INTEGER DEFAULT 0, -- subscription_id if sub
+            target_id INTEGER DEFAULT 0,
             amount REAL,
             status TEXT DEFAULT 'active'
         )
@@ -208,6 +224,12 @@ class ClientStates(StatesGroup):
     entering_title = State()
     entering_desc = State()
     entering_budget = State()
+
+class ListingStates(StatesGroup):
+    choosing_category = State()
+    entering_title = State()
+    entering_desc = State()
+    entering_price = State()
 
 class DepositStates(StatesGroup):
     entering_deposit_amount = State()
@@ -292,6 +314,7 @@ def main_menu_keyboard(role: str):
         kb.append([KeyboardButton(text="💼 Мои заказы / Тикеты")])
         
     if role == 'executor':
+        kb.append([KeyboardButton(text="📦 Мои товары/услуги"), KeyboardButton(text="➕ Опубликовать услугу")])
         kb.append([KeyboardButton(text="📦 Доступные заказы"), KeyboardButton(text="💳 Моя подписка")])
     elif role == 'admin':
         kb.append([KeyboardButton(text="⚙️ Админ-панель")])
@@ -300,6 +323,7 @@ def main_menu_keyboard(role: str):
 def admin_menu_keyboard():
     kb = [
         [InlineKeyboardButton(text="📂 Управление каталогом", callback_data="adm_catalog")],
+        [InlineKeyboardButton(text="🛍 Модерация товаров", callback_data="adm_listings")],
         [InlineKeyboardButton(text="💼 Управление подписками", callback_data="adm_subs")],
         [InlineKeyboardButton(text="📊 Настройка комиссий", callback_data="adm_commissions")],
         [InlineKeyboardButton(text="💰 Выдать / Списать баланс", callback_data="adm_give_balance")],
@@ -519,16 +543,30 @@ async def user_category_view(callback: types.CallbackQuery):
     c_id, name, desc, parent_id = cat
     cursor.execute("SELECT id, name FROM categories WHERE parent_id = ?", (cat_id,))
     subcategories = cursor.fetchall()
+    
+    # Fetch active executor listings in this category
+    cursor.execute("""
+        SELECT el.id, el.title, el.price, u.full_name, u.rating, u.user_id 
+        FROM executor_listings el
+        JOIN users u ON el.executor_id = u.user_id
+        WHERE el.category_id = ? AND el.status = 'active'
+    """, (cat_id,))
+    listings = cursor.fetchall()
     conn.close()
 
-    text = f"📁 <b>Раздел: {name}</b>\n\n{desc or 'Выберите нужную услугу или подраздел ниже:'}"
+    text = f"📁 <b>Раздел: {name}</b>\n\n{desc or 'Выберите подраздел или просмотрите готовые предложения исполнителей ниже:'}"
     kb = []
 
     if subcategories:
         for sub_id, sub_name in subcategories:
             kb.append([InlineKeyboardButton(text=f"🔹 {sub_name}", callback_data=f"user_cat_{sub_id}")])
-    else:
-        kb.append([InlineKeyboardButton(text="📝 Создать заказ в этой категории", callback_data=f"create_ticket_{cat_id}")])
+            
+    if listings:
+        text += "\n\n🛍 <b>Готовые предложения исполнителей в этом разделе:</b>"
+        for l_id, l_title, l_price, exec_name, exec_rating, exec_id in listings:
+            kb.append([InlineKeyboardButton(text=f"⭐ {exec_rating} | {l_title} — {l_price} USDT", callback_data=f"view_listing_{l_id}")])
+
+    kb.append([InlineKeyboardButton(text="📝 Создать индивидуальный заказ", callback_data=f"create_ticket_{cat_id}")])
 
     if parent_id:
         kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"user_cat_{parent_id}")])
@@ -540,6 +578,75 @@ async def user_category_view(callback: types.CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
+
+@dp.callback_query(F.data.startswith("view_listing_"))
+async def view_listing_callback(callback: types.CallbackQuery):
+    l_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT el.title, el.description, el.price, u.full_name, u.rating, u.user_id 
+        FROM executor_listings el
+        JOIN users u ON el.executor_id = u.user_id
+        WHERE el.id = ? AND el.status = 'active'
+    """, (l_id,))
+    listing = cursor.fetchone()
+    conn.close()
+    
+    if not listing:
+        await callback.answer("Предложение не найдено или снято с публикации.", show_alert=True)
+        return
+        
+    title, desc, price, exec_name, exec_rating, exec_id = listing
+    text = (
+        f"🛍 <b>Предложение: {title}</b>\n\n"
+        f"👤 <b>Исполнитель:</b> {exec_name} (Рейтинг: ⭐ {exec_rating})\n"
+        f"💰 <b>Стоимость:</b> <b>{price} USDT</b>\n\n"
+        f"📝 <b>Описание:</b>\n{desc}"
+    )
+    kb = [
+        [InlineKeyboardButton(text="🤝 Заказать у исполнителя", callback_data=f"buy_listing_{l_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"user_cat_{callback.message.json if hasattr(callback.message, 'json') else ''}")]
+    ]
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("buy_listing_"))
+async def buy_listing_callback(callback: types.CallbackQuery, state: FSMContext):
+    l_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT executor_id, category_id, title, price FROM executor_listings WHERE id = ?", (l_id,))
+    listing = cursor.fetchone()
+    conn.close()
+    
+    if not listing:
+        await callback.answer("Предложение не найдено.", show_alert=True)
+        return
+        
+    exec_id, cat_id, title, price = listing
+    user = get_user(callback.from_user.id)
+    
+    if user['balance'] < price:
+        await callback.answer(f"❌ Недостаточно средств на балансе. Требуется {price} USDT.", show_alert=True)
+        return
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, callback.from_user.id))
+    cursor.execute("""
+        INSERT INTO tickets (client_id, category_id, title, description, budget, status, executor_id, created_at)
+        VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
+    """, (callback.from_user.id, cat_id, f"Покупка товара: {title}", f"Автозаказ по опубликованному предложению #{l_id}", price, exec_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+    
+    await callback.message.answer(f"✅ <b>Заказ успешно создан и передан исполнителю в работу!</b>\nСредства зарезервированы. Проверьте «Мои заказы» для общения в чате.", parse_mode="HTML")
+    try:
+        await bot.send_message(exec_id, f"🎉 <b>У вас новый заказ по вашему товару «{title}»!</b>\nПерейдите в раздел «Мои заказы / Тикеты» для общения с клиентом.", parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
 
 @dp.callback_query(F.data == "back_to_catalog_root")
 async def back_to_catalog_root(callback: types.CallbackQuery):
@@ -555,6 +662,118 @@ async def back_to_catalog_root(callback: types.CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
+
+@dp.message(F.text == "➕ Опубликовать услугу")
+async def publish_listing_start(message: types.Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    if user['role'] != 'executor':
+        await message.answer("⚠️ Публикация товаров и услуг доступна только исполнителям.")
+        return
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM categories")
+    categories = cursor.fetchall()
+    conn.close()
+    
+    if not categories:
+        await message.answer("❌ Каталог еще не настроен администратором.")
+        return
+        
+    kb = []
+    for c_id, c_name in categories:
+        kb.append([InlineKeyboardButton(text=f"📁 {c_name}", callback_data=f"pub_cat_{c_id}")])
+        
+    await state.set_state(ListingStates.choosing_category)
+    await message.answer("📦 <b>Выберите категорию, в которой хотите опубликовать свой товар или услугу:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(ListingStates.choosing_category, F.data.startswith("pub_cat_"))
+async def pub_cat_selected(callback: types.CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split("_")[2])
+    await state.update_data(category_id=cat_id)
+    await state.set_state(ListingStates.entering_title)
+    await callback.message.answer("✍️ <b>Введите название вашего товара или услуги:</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(ListingStates.entering_title)
+async def pub_title_entered(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text)
+    await state.set_state(ListingStates.entering_desc)
+    await message.answer("📝 <b>Подробно опишите вашу услугу / товар, условия и сроки выполнения:</b>", parse_mode="HTML")
+
+@dp.message(ListingStates.entering_desc)
+async def pub_desc_entered(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await state.set_state(ListingStates.entering_price)
+    await message.answer("💰 <b>Укажите фиксированную стоимость в USDT (например: 50):</b>", parse_mode="HTML")
+
+@dp.message(ListingStates.entering_price)
+async def pub_price_entered(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text.replace(",", "."))
+        if price <= 0: raise ValueError()
+    except ValueError:
+        await message.answer("❌ Введите корректное положительное число для стоимости.")
+        return
+        
+    data = await state.get_data()
+    cat_id = data['category_id']
+    title = data['title']
+    desc = data['description']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO executor_listings (executor_id, category_id, title, description, price, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    """, (message.from_user.id, cat_id, title, desc, price, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    user = get_user(message.from_user.id)
+    await message.answer("✅ <b>Ваш товар успешно отправлен на модерацию администратору!</b>\nПосле проверки он появится в соответствующем разделе каталога.", parse_mode="HTML", reply_markup=main_menu_keyboard(user['role']))
+    
+    # Notify admin
+    try:
+        await bot.send_message(DEFAULT_ADMIN_ID, f"🔔 <b>Новая заявка на публикацию товара от ID {message.from_user.id}!</b>\nПроверьте в админ-панели.", parse_mode="HTML")
+    except Exception:
+        pass
+
+@dp.message(F.text == "📦 Мои товары/услуги")
+async def my_listings_handler(message: types.Message):
+    user = get_user(message.from_user.id)
+    if user['role'] != 'executor':
+        return
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, price, status FROM executor_listings WHERE executor_id = ?", (message.from_user.id,))
+    listings = cursor.fetchall()
+    conn.close()
+    
+    if not listings:
+        await message.answer("📭 У вас пока нет опубликованных товаров или услуг.")
+        return
+        
+    for l_id, title, price, status in listings:
+        status_text = {"pending": "⏳ На модерации", "active": "🟢 Активен", "rejected": "❌ Отклонен"}.get(status, status)
+        text = f"🛍 <b>#{l_id} {title}</b>\n💰 Цена: <b>{price} USDT</b>\nСтатус: <code>{status_text}</code>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"del_listing_{l_id}")]
+        ])
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("del_listing_"))
+async def delete_listing_callback(callback: types.CallbackQuery):
+    l_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM executor_listings WHERE id = ? AND executor_id = ?", (l_id, callback.from_user.id))
+    conn.commit()
+    conn.close()
+    await callback.answer("Товар удален.", show_alert=True)
+    await callback.message.delete()
 
 @dp.callback_query(F.data.startswith("create_ticket_"))
 async def start_create_ticket(callback: types.CallbackQuery, state: FSMContext):
@@ -598,7 +817,6 @@ async def ticket_budget_entered(message: types.Message, state: FSMContext):
     
     conn = get_db()
     cursor = conn.cursor()
-    # Списываем баланс в холдирование
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (budget, message.from_user.id))
     cursor.execute("""
         INSERT INTO tickets (client_id, category_id, title, description, budget, status, created_at)
@@ -774,7 +992,6 @@ async def complete_ticket_callback(callback: types.CallbackQuery, state: FSMCont
         
     cursor.execute("UPDATE tickets SET status = 'completed' WHERE id = ?", (t_id,))
     
-    # Расчет комиссии исполнителя
     cursor.execute("SELECT subscription_id, commission_rate FROM users WHERE user_id = ?", (exec_id,))
     exec_user = cursor.fetchone()
     
@@ -1029,6 +1246,76 @@ async def back_to_admin(callback: types.CallbackQuery):
         reply_markup=admin_menu_keyboard()
     )
 
+@dp.callback_query(F.data == "adm_listings")
+async def adm_listings_view(callback: types.CallbackQuery):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT el.id, el.title, el.price, u.full_name, el.executor_id 
+        FROM executor_listings el
+        JOIN users u ON el.executor_id = u.user_id
+        WHERE el.status = 'pending'
+    """)
+    listings = cursor.fetchall()
+    conn.close()
+    
+    text = "🛍 <b>Модерация товаров и услуг:</b>\n\n"
+    kb = []
+    if not listings:
+        text += "Нет товаров, ожидающих модерации."
+    else:
+        for l_id, title, price, exec_name, exec_id in listings:
+            text += f"📦 <b>#{l_id} {title}</b> — {price} USDT\n └ Исполнитель: {exec_name} (ID: <code>{exec_id}</code>)\n\n"
+            kb.append([
+                InlineKeyboardButton(text=f"✅ Одобрить #{l_id}", callback_data=f"approve_listing_{l_id}"),
+                InlineKeyboardButton(text=f"❌ Отклонить #{l_id}", callback_data=f"reject_listing_{l_id}")
+            ])
+            
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_admin")])
+    await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("approve_listing_"))
+async def approve_listing_callback(callback: types.CallbackQuery):
+    l_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT executor_id, title FROM executor_listings WHERE id = ?", (l_id,))
+    item = cursor.fetchone()
+    
+    if item:
+        exec_id, title = item[0], item[1]
+        cursor.execute("UPDATE executor_listings SET status = 'active' WHERE id = ?", (l_id,))
+        conn.commit()
+        try:
+            await bot.send_message(exec_id, f"🎉 <b>Ваш товар «{title}» успешно прошел модерацию и опубликован в каталоге!</b>", parse_mode="HTML")
+        except Exception:
+            pass
+            
+    conn.close()
+    await callback.answer("Товар одобрен и опубликован!")
+    await adm_listings_view(callback)
+
+@dp.callback_query(F.data.startswith("reject_listing_"))
+async def reject_listing_callback(callback: types.CallbackQuery):
+    l_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT executor_id, title FROM executor_listings WHERE id = ?", (l_id,))
+    item = cursor.fetchone()
+    
+    if item:
+        exec_id, title = item[0], item[1]
+        cursor.execute("UPDATE executor_listings SET status = 'rejected' WHERE id = ?", (l_id,))
+        conn.commit()
+        try:
+            await bot.send_message(exec_id, f"❌ <b>К сожалению, ваш товар «{title}» был отклонен модератором.</b>", parse_mode="HTML")
+        except Exception:
+            pass
+            
+    conn.close()
+    await callback.answer("Товар отклонен.")
+    await adm_listings_view(callback)
+
 @dp.callback_query(F.data == "adm_commissions")
 async def adm_commissions_view(callback: types.CallbackQuery):
     def_comm = get_setting("default_commission", "10.0")
@@ -1059,7 +1346,7 @@ async def global_comm_entered(message: types.Message, state: FSMContext):
         
     set_setting("default_commission", str(comm))
     await state.clear()
-    await message.answer(f"✅ <b>Общий процент комиссии системы успешно устновлен на {comm}%!</b>", parse_mode="HTML")
+    await message.answer(f"✅ <b>Общий процент комиссии системы успешно установлен на {comm}%!</b>", parse_mode="HTML")
 
 @dp.callback_query(F.data == "adm_give_balance")
 async def adm_give_balance_start(callback: types.CallbackQuery, state: FSMContext):
@@ -1338,7 +1625,7 @@ async def reject_app_callback(callback: types.CallbackQuery):
     await adm_applications_view(callback)
 
 async def main():
-    print("🚀 Bot started successfully with all new features!")
+    print("🚀 Bot started successfully with executor listings feature!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
