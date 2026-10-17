@@ -652,10 +652,6 @@ async def available_tickets_handler(message: types.Message):
         await message.answer("Раздел доступен только исполнителям.")
         return
         
-    if not user['subscription_id']:
-        await message.answer("⚠️ У вас нет активной подписки.")
-        return
-        
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, title, description, budget, created_at FROM tickets WHERE status = 'open'")
