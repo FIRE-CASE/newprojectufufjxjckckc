@@ -20,7 +20,7 @@ BOT_TOKEN = "8928950087:AAGFtUkiRgRZnZgMLNF1EJBKtU20xShhqyw"
 PAYMENT_PROVIDER_TOKEN = "PROVIDER_TOKEN_FROM_BOTFATHER" # Укажите токен провайдера платежей или оставьте тест для Stars
 
 # ID администратора по умолчанию (замените на ваш Telegram ID)
-DEFAULT_ADMIN_ID = 123456789
+DEFAULT_ADMIN_ID = 8106424143
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
