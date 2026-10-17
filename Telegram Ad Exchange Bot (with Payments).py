@@ -104,7 +104,7 @@ def init_db():
         )
     """)
     
-    # Orders / Tickets table
+    # Orders / Tickets table (unified for custom tickets and purchased listings)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +115,7 @@ def init_db():
             budget REAL,
             status TEXT DEFAULT 'open', -- open, in_progress, completed, cancelled
             executor_id INTEGER,
+            listing_id INTEGER DEFAULT NULL,
             created_at TEXT
         )
     """)
@@ -606,7 +607,7 @@ async def view_listing_callback(callback: types.CallbackQuery):
     )
     kb = [
         [InlineKeyboardButton(text="🤝 Заказать у исполнителя", callback_data=f"buy_listing_{l_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"user_cat_{callback.message.json if hasattr(callback.message, 'json') else ''}")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_catalog_root")]
     ]
     await callback.message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
@@ -618,9 +619,9 @@ async def buy_listing_callback(callback: types.CallbackQuery, state: FSMContext)
     cursor = conn.cursor()
     cursor.execute("SELECT executor_id, category_id, title, price FROM executor_listings WHERE id = ?", (l_id,))
     listing = cursor.fetchone()
-    conn.close()
     
     if not listing:
+        conn.close()
         await callback.answer("Предложение не найдено.", show_alert=True)
         return
         
@@ -628,20 +629,24 @@ async def buy_listing_callback(callback: types.CallbackQuery, state: FSMContext)
     user = get_user(callback.from_user.id)
     
     if user['balance'] < price:
+        conn.close()
         await callback.answer(f"❌ Недостаточно средств на балансе. Требуется {price} USDT.", show_alert=True)
         return
         
-    conn = get_db()
-    cursor = conn.cursor()
+    # Deduct balance & create an active ticket entry mapped to this listing for unified chat & completion workflow
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, callback.from_user.id))
     cursor.execute("""
-        INSERT INTO tickets (client_id, category_id, title, description, budget, status, executor_id, created_at)
-        VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
-    """, (callback.from_user.id, cat_id, f"Покупка товара: {title}", f"Автозаказ по опубликованному предложению #{l_id}", price, exec_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        INSERT INTO tickets (client_id, category_id, title, description, budget, status, executor_id, listing_id, created_at)
+        VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?)
+    """, (callback.from_user.id, cat_id, f"Покупка товара: {title}", f"Автозаказ по опубликованному предложению #{l_id}", price, exec_id, l_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     conn.close()
     
-    await callback.message.answer(f"✅ <b>Заказ успешно создан и передан исполнителю в работу!</b>\nСредства зарезервированы. Проверьте «Мои заказы» для общения в чате.", parse_mode="HTML")
+    await callback.message.answer(
+        f"✅ <b>Заказ по товару успешно создан и передан исполнителю в работу!</b>\n"
+        f"Средства зарезервированы. Перейдите в раздел <b>«Мои заказы / Тикеты»</b> для открытия чата с исполнителем и контроля сдачи.",
+        parse_mode="HTML"
+    )
     try:
         await bot.send_message(exec_id, f"🎉 <b>У вас новый заказ по вашему товару «{title}»!</b>\nПерейдите в раздел «Мои заказы / Тикеты» для общения с клиентом.", parse_mode="HTML")
     except Exception:
@@ -734,7 +739,6 @@ async def pub_price_entered(message: types.Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await message.answer("✅ <b>Ваш товар успешно отправлен на модерацию администратору!</b>\nПосле проверки он появится в соответствующем разделе каталога.", parse_mode="HTML", reply_markup=main_menu_keyboard(user['role']))
     
-    # Notify admin
     try:
         await bot.send_message(DEFAULT_ADMIN_ID, f"🔔 <b>Новая заявка на публикацию товара от ID {message.from_user.id}!</b>\nПроверьте в админ-панели.", parse_mode="HTML")
     except Exception:
@@ -832,16 +836,14 @@ async def ticket_budget_entered(message: types.Message, state: FSMContext):
 async def my_tickets_handler(message: types.Message):
     user = get_user(message.from_user.id)
     
-    if user['role'] not in ('executor', 'admin'):
-        await message.answer("⚠️ Раздел «Мои заказы» доступен только исполнителям и администраторам.")
-        return
-
     conn = get_db()
     cursor = conn.cursor()
     
     if user['role'] == 'executor':
         cursor.execute("SELECT id, title, status, budget, client_id FROM tickets WHERE executor_id = ?", (message.from_user.id,))
-    else:
+    elif user['role'] == 'client':
+        cursor.execute("SELECT id, title, status, budget, client_id FROM tickets WHERE client_id = ?", (message.from_user.id,))
+    else: # admin
         cursor.execute("SELECT id, title, status, budget, client_id FROM tickets")
         
     tickets = cursor.fetchall()
@@ -853,7 +855,8 @@ async def my_tickets_handler(message: types.Message):
         
     for t in tickets:
         t_id, title, status, budget, client_id = t[0], t[1], t[2], t[3], t[4]
-        text = f"📌 <b>Заказ #{t_id}: {title}</b>\nСтатус: <code>{status.upper()}</code>\nБюджет: <b>{budget} USDT</b>"
+        status_display = {"open": "🟢 Открыт", "in_progress": "⏳ В работе", "completed": "✅ Завершен", "cancelled": "❌ Отменен"}.get(status, status)
+        text = f"📌 <b>Заказ #{t_id}: {title}</b>\nСтатус: <code>{status_display}</code>\nБюджет: <b>{budget} USDT</b>"
         
         kb = []
         if status == 'in_progress':
@@ -1625,7 +1628,7 @@ async def reject_app_callback(callback: types.CallbackQuery):
     await adm_applications_view(callback)
 
 async def main():
-    print("🚀 Bot started successfully with executor listings feature!")
+    print("🚀 Bot started successfully with unified chat and listing purchase workflow!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
